@@ -1,0 +1,143 @@
+# GrainGen V2.0
+# This script generates idealised and representative meshed micro-structure geometries 
+# in 2-D and 3-D through the Abaqus geometry kernel. - J. Grogan, 09/06/2011 
+#
+# Import Neccesary Abaqus Modules
+from abaqusConstants import *
+from abaqus import *
+import random
+import subprocess
+import regionToolset
+import mesh
+import step
+import part
+import interaction
+import sys
+import GeomModules
+# Create CAE File and Set Up Model
+VerFile=Mdb(pathName="MStructure")
+ModelParams=open('pythonoptions.dat','r')
+VerModel=VerFile.models['Model-1']
+VerAssembly=VerModel.rootAssembly
+# Read Model Params from File
+shape=int(ModelParams.readline())
+part_type=int(ModelParams.readline())
+dimension=int(ModelParams.readline())
+rad=float(ModelParams.readline())
+meshsize=float(ModelParams.readline())
+num_high=int(ModelParams.readline())
+num_wide=int(ModelParams.readline())
+num_thick=int(ModelParams.readline())
+num_grains=num_high*num_wide*num_thick
+num_grains=int(ModelParams.readline())
+scalex=float(ModelParams.readline())
+scaley=float(ModelParams.readline())
+ana_type=int(ModelParams.readline())
+hard_rad=float(ModelParams.readline())
+# For 2-D Solids thickness is set equal to one element
+if dimension==3:
+	extrude_depth=rad
+else:
+	extrude_depth=meshsize
+	num_thick=1
+# Square Grains
+if shape==1:
+	GeomModules.DrawSquare(VerModel,part_type,rad,extrude_depth)
+# Hexagonal Grains
+if shape==2:
+	GeomModules.DrawHexagon(VerModel,part_type,rad,extrude_depth)
+# Dodecahedral Grains
+if shape==3:
+	GeomModules.DrawDodec(VerModel,part_type,rad,extrude_depth)	
+# Voronoi Tessellation
+if shape==4:
+	if dimension==2:
+		GeomModules.Voronoi2D(VerModel,part_type,rad,extrude_depth,num_grains,scalex,scaley,hard_rad)
+	else:
+		GeomModules.Voronoi3D(VerModel,part_type,rad,extrude_depth,num_grains,hard_rad)
+scalex=scalex/1.
+scaley=scaley/2.
+# Make Boolean Template
+if shape>1:
+	GeomModules.BooleanPart(VerModel,part_type,rad,extrude_depth,num_high,
+		num_wide,num_thick,shape,dimension,scalex,scaley)
+	BoolPart=VerModel.parts['Template']
+# Instance base part - offset instances as required
+if shape<=3:
+	VerPart=VerModel.parts['Base']
+	GeomModules.PatternParts(num_high,num_wide,num_thick,VerPart,rad,shape,VerModel)
+OldPart=VerModel.parts['Merged']
+if shape==1:
+	VerPart=VerModel.parts['Merged']
+	del VerAssembly.instances['Merged-1']       
+else:
+	VerAssembly.InstanceFromBooleanCut(name='FinalPart', 
+		instanceToBeCut=VerAssembly.instances['Merged-1'], 
+		cuttingInstances=(VerAssembly.instances['Template-1'], ), 
+		originalInstances=DELETE)
+	del VerAssembly.instances['FinalPart-1']
+	VerPart=VerModel.parts['FinalPart']
+# Mesh Part
+if meshsize>0.:
+	if shape<3:
+		VerPart.setMeshControls(regions=VerPart.cells, elemShape=HEX, technique=STRUCTURED)
+	if shape==3:
+		VerPart.setMeshControls(regions=VerPart.cells, elemShape=TET, technique=FREE)
+	if shape==4:
+		if dimension==2:
+		    VerPart.setMeshControls(regions=VerPart.cells, elemShape=HEX, technique=SWEEP, 
+				algorithm=ADVANCING_FRONT)			
+		else:
+			VerPart.setMeshControls(regions=VerPart.cells, elemShape=TET, technique=FREE)
+	VerPart.seedPart(size=meshsize)
+	VerPart.generateMesh()	
+# For Corrosion Analysis Output Part Vertices and Element Connectivity
+if ana_type==2:
+	GeomModules.VertsConn(OldPart,VerPart,dimension,shape,rad,extrude_depth)
+	ecor=open('ecor.dat','w')
+	for eachface in VerPart.faces:
+		if len(eachface.getAdjacentFaces())<7.:
+			xnor=eachface.getNormal()[0]
+			ynor=eachface.getNormal()[1]
+			znor=eachface.getNormal()[2]
+			if (xnor==0.)and(znor==0.):
+#				if (ynor==1.)or(ynor==-1.):	
+				if (ynor==1.):					
+					for eachelement in eachface.getElements():
+						ecor.write("%i\n"%(eachelement.label))
+	ecor.close()
+	# Generate Materials and Sections
+	MatName='Grain'
+	CorRate=0.05
+	GeomModules.MatGen(MatName,CorRate,ana_type,VerPart,VerModel,part_type,meshsize)
+	MatName='Boundary'
+	CorRate=0.5
+	GeomModules.MatGen(MatName,CorRate,ana_type,VerPart,VerModel,part_type,meshsize)
+else:
+	GeomModules.MatGen('',0.,ana_type,VerPart,VerModel,part_type,meshsize)		
+#STEPS
+VerModel.ExplicitDynamicsStep(name='Corrode', previous='Initial', 
+	massScaling=((SEMI_AUTOMATIC, MODEL, AT_BEGINNING, 0.0, 1e-06, 
+	BELOW_MIN, 0, 0, 0.0, 0.0, 0, None), ))
+VerModel.ExplicitDynamicsStep(name='Load', previous='Corrode', 
+	timePeriod=1.)
+VerModel.steps['Corrode'].Restart(numberIntervals=2,overlay=OFF,timeMarks=OFF) 
+VerModel.steps['Load'].Restart(numberIntervals=2,overlay=OFF, timeMarks=OFF)		
+#Loads and BCs
+VerAssembly.Instance(name='CorPart',part=VerPart, dependent=ON)
+iNodes=VerAssembly.instances['CorPart'].nodes
+GeomModules.S1BCs(iNodes,VerModel,num_high,num_wide,num_thick,shape,
+	dimension,extrude_depth,rad,scalex,scaley)	
+#Create and Submit Job
+VerModel.FieldOutputRequest(name='F-Output-1', 
+	createStepName='Corrode', variables=(
+	'A', 'CSTRESS', 'LE', 'PE', 'PEEQ', 'RF', 'S', 'SDV', 'STATUS', 'U', 
+	'V'), numIntervals=100)
+VerFile.Job(name='GeomGenTemp', model='Model-1', description='', type=ANALYSIS, 
+	atTime=None, waitMinutes=0, waitHours=0, queue=None, 
+	explicitPrecision=SINGLE, nodalOutputPrecision=SINGLE, echoPrint=OFF, 
+	modelPrint=OFF, contactPrint=OFF, historyPrint=OFF, userSubroutine='', 
+	scratch='', parallelizationMethodExplicit=DOMAIN, numDomains=4, 
+	activateLoadBalancing=False, multiprocessingMode=DEFAULT, numCpus=4)
+#OptFile.jobs['StentOpt1'].submit(consistencyChecking=OFF)
+VerFile.jobs['GeomGenTemp'].writeInput(consistencyChecking=OFF)
